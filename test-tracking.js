@@ -68,19 +68,20 @@ async function trackOrder247(orderCode) {
         ? d.confirmImage[0] 
         : null;
 
-    return { text: msg.trim(), imageUrl: billImageUrl };
+    if (billImageUrl) {
+        msg += `\n\n🖼️ Hình ảnh vận đơn:\n${billImageUrl}`;
+    }
+
+    return msg.trim();
 }
 
 // Lấy mã vận đơn từ command line
-const orderCode = process.argv[2] || '90062162866';
+const orderCode = process.argv[2] || '90062162865';
 console.log(`\n🧪 Testing tracking for: ${orderCode}\n`);
 
 trackOrder247(orderCode).then(result => {
     console.log('\n=== KẾT QUẢ TIN NHẮN ===\n');
-    console.log(result.text);
-    if (result.imageUrl) {
-        console.log(`\n🖼️ HÌNH ẢNH BILL: ${result.imageUrl}`);
-    }
+    console.log(result);
 }).catch(err => {
     console.error('Error:', err);
 });

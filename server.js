@@ -191,10 +191,14 @@ async function trackOrder247(orderCode) {
             ? d.confirmImage[0] 
             : null;
 
-        return { text: msg.trim(), imageUrl: billImageUrl };
+        if (billImageUrl) {
+            msg += `\n\n🖼️ Hình ảnh vận đơn:\n${billImageUrl}`;
+        }
+
+        return msg.trim();
     } catch (err) {
         console.error('247 Tracking Error:', err.message);
-        return { text: `⚠️ Lỗi tra cứu vận đơn: ${err.message}` };
+        return `⚠️ Lỗi tra cứu vận đơn: ${err.message}`;
     }
 }
 
@@ -234,24 +238,7 @@ async function startBot(api) {
                 reply = await searchGoogleSheet(param);
             } else if (text.toLowerCase().startsWith("tracking ")) {
                 const orderCode = text.substring(9).trim();
-                const result = await trackOrder247(orderCode);
-                
-                // Handle tracking result object (text + image)
-                const threadType = isGroup ? ThreadType.Group : ThreadType.User;
-                
-                // Send text info
-                await api.sendMessage({ msg: result.text }, targetId, threadType);
-                
-                // Send image if available
-                if (result.imageUrl) {
-                    try {
-                        console.log(`📸 Sending bill image: ${result.imageUrl}`);
-                        await api.sendImage(targetId, { url: result.imageUrl }, threadType);
-                    } catch (imgErr) {
-                        console.error("Failed to send tracking image:", imgErr.message);
-                    }
-                }
-                return; // Early return as we handled sending already
+                reply = await trackOrder247(orderCode);
             } else if (text.toLowerCase() === "ping") {
                 reply = "pong!";
             }
