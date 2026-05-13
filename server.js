@@ -9,6 +9,7 @@ const next = require('next');
 const { Redis } = require('@upstash/redis');
 const { GoogleSpreadsheet } = require('google-spreadsheet');
 const { JWT } = require('google-auth-library');
+const sharp = require('sharp');
 
 dotenv.config();
 
@@ -111,6 +112,92 @@ async function searchGoogleSheet(searchKey) {
         return `⚠️ Lỗi tra cứu dữ liệu: ${err.message}`;
     }
 }
+
+// Map status codes or names to Vietnamese labels with icons
+const STATUS_MAP = {
+    'DATIEPNHAN':     '📦 Đã tiếp nhận',
+    'Nhập hệ thống':  '📦 Đã tiếp nhận',
+    'DALAYHANG':      '🚚 Đã lấy hàng',
+    'Đã lấy hàng':     '🚚 Đã lấy hàng',
+    'DANGVANCHUYEN':  '🔄 Đang vận chuyển',
+    'Đang vận chuyển': '🔄 Đang vận chuyển',
+    'Đóng gói':        '📦 Đang đóng gói',
+    'Đến bưu cục':     '🏬 Đã đến bưu cục',
+    'Giao bưu tá phát': '🛵 Giao bưu tá',
+    'DANGDIPHAT':     '🛵 Đang đi phát',
+    'Đi phát':         '🛵 Đang đi phát',
+    'PHATTHANHCONG':  '✅ Phát thành công',
+    'Phát thành công': '✅ Phát thành công',
+    'HOANVE':         '↩️ Hoàn về',
+    'HUY':            '❌ Đã hủy',
+};
+
+async function trackOrder247(orderCode) {
+    try {
+        const apiKey = process.env.GH247_API_KEY;
+        if (!apiKey) {
+            return { text: '⚠️ Chưa cấu hình GH247_API_KEY. Vui lòng liên hệ admin.' };
+        }
+
+        const url = `https://tracking.247express.vn/api/Order/v1/Tracking?ordercode=${encodeURIComponent(orderCode)}&apikey=${apiKey}`;
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+        const d = await res.json();
+
+        // API returns errorCode when not found
+        if (d.errorCode || !d.orderCode) {
+            return { text: `❌ Không tìm thấy đơn hàng "${orderCode}".\nKiểm tra lại mã vận đơn hoặc thử lại sau.` };
+        }
+
+        // Latest status from statuses array
+        const latestStatus = d.statuses && d.statuses.length > 0
+            ? d.statuses[d.statuses.length - 1]
+            : null;
+        
+        const statusLabel = latestStatus
+            ? (STATUS_MAP[latestStatus.statusName] || STATUS_MAP[latestStatus.trackingName] || latestStatus.trackingName || latestStatus.statusName)
+            : '---';
+
+        // Format date helper
+        const fmtDate = (iso) => {
+            if (!iso) return '';
+            const dt = new Date(iso);
+            return `${dt.getDate().toString().padStart(2,'0')}/${(dt.getMonth()+1).toString().padStart(2,'0')} ${dt.getHours().toString().padStart(2,'0')}:${dt.getMinutes().toString().padStart(2,'0')}`;
+        };
+
+        let msg = `🔍 Vận đơn: ${d.orderCode}\n`;
+        msg += `━━━━━━━━━━━━━━━━━━━\n`;
+        msg += `📌 Trạng thái: ${statusLabel}\n`;
+        if (d.realWeight) msg += `⚖️ Khối lượng: ${d.realWeight}g\n`;
+        if (d.totalServiceCost) msg += `💰 Phí: ${Number(d.totalServiceCost).toLocaleString('vi-VN')}đ\n`;
+        if (d.receiverName) msg += `\n📥 Người nhận: ${d.receiverName}\n`;
+
+        // Last 4 tracking events
+        if (Array.isArray(d.trackings) && d.trackings.length > 0) {
+            msg += `\n📋 Hành trình:\n`;
+            const recent = d.trackings.slice(-4).reverse();
+            for (const t of recent) {
+                const icon = (STATUS_MAP[t.statusName] || STATUS_MAP[t.trackingName])
+                    ? (STATUS_MAP[t.statusName] || STATUS_MAP[t.trackingName]).split(' ')[0]
+                    : '▪️';
+                const place = t.postOfficeName ? ` (${t.postOfficeName})` : '';
+                msg += `${icon} ${t.statusName}${place} - ${fmtDate(t.dateChange)}\n`;
+            }
+        }
+
+        // Get bill image if exists
+        const billImageUrl = (Array.isArray(d.confirmImage) && d.confirmImage.length > 0) 
+            ? d.confirmImage[0] 
+            : null;
+
+        return { text: msg.trim(), imageUrl: billImageUrl };
+    } catch (err) {
+        console.error('247 Tracking Error:', err.message);
+        return { text: `⚠️ Lỗi tra cứu vận đơn: ${err.message}` };
+    }
+}
+
 async function startBot(api) {
     zaloApi = api;
     botStatus = 'connected';
@@ -145,6 +232,26 @@ async function startBot(api) {
             if (text.toLowerCase().startsWith("check ")) {
                 const param = text.substring(6).trim();
                 reply = await searchGoogleSheet(param);
+            } else if (text.toLowerCase().startsWith("tracking ")) {
+                const orderCode = text.substring(9).trim();
+                const result = await trackOrder247(orderCode);
+                
+                // Handle tracking result object (text + image)
+                const threadType = isGroup ? ThreadType.Group : ThreadType.User;
+                
+                // Send text info
+                await api.sendMessage({ msg: result.text }, targetId, threadType);
+                
+                // Send image if available
+                if (result.imageUrl) {
+                    try {
+                        console.log(`📸 Sending bill image: ${result.imageUrl}`);
+                        await api.sendImage(targetId, { url: result.imageUrl }, threadType);
+                    } catch (imgErr) {
+                        console.error("Failed to send tracking image:", imgErr.message);
+                    }
+                }
+                return; // Early return as we handled sending already
             } else if (text.toLowerCase() === "ping") {
                 reply = "pong!";
             }
@@ -176,7 +283,17 @@ async function startBot(api) {
 async function login() {
     botStatus = 'logging_in';
     io.emit('status', { status: botStatus });
-    const zalo = new Zalo();
+    
+    // Zalo init with sharp for image metadata
+    const zalo = new Zalo({}, {
+        imageMetadataGetter: async (filePath) => {
+            const metadata = await sharp(filePath).metadata();
+            return {
+                width: metadata.width,
+                height: metadata.height,
+            };
+        },
+    });
 
     // Try to restore session from Redis first, then local file
     let cookie = null;
