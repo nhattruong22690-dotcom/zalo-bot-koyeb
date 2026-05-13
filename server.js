@@ -1,4 +1,4 @@
-const { Zalo, ThreadType } = require('zca-js');
+const { Zalo, ThreadType, GroupMessage, UserMessage } = require('zca-js');
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -7,6 +7,8 @@ const path = require('path');
 const dotenv = require('dotenv');
 const next = require('next');
 const { Redis } = require('@upstash/redis');
+const { GoogleSpreadsheet } = require('google-spreadsheet');
+const { JWT } = require('google-auth-library');
 
 dotenv.config();
 
@@ -18,17 +20,97 @@ const PORT = process.env.PORT || 3000;
 const SESSION_FILE = path.join(__dirname, 'session.json');
 
 // Initialize Redis if credentials exist
-const redis = (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) 
+const redis = (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN)
     ? new Redis({
         url: process.env.UPSTASH_REDIS_REST_URL,
         token: process.env.UPSTASH_REDIS_REST_TOKEN,
-    }) 
+    })
     : null;
 
 let zaloApi = null;
 let botStatus = 'disconnected';
 let qrData = null;
 
+// Normalize Vietnamese text for searching
+function normalizeText(text) {
+    if (!text) return '';
+    return String(text)
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/đ/g, 'd')
+        .replace(/Đ/g, 'D')
+        .toLowerCase()
+        .trim();
+}
+
+async function searchGoogleSheet(searchKey) {
+    try {
+        const sheetId = process.env.GOOGLE_SHEET_ID;
+        const clientEmail = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
+        const privateKey = process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n');
+
+        if (!sheetId || !clientEmail || !privateKey) {
+            return "⚠️ Hệ thống chưa cấu hình đầy đủ thông tin Google Sheet (ID, Email hoặc Private Key).";
+        }
+
+        const serviceAccountAuth = new JWT({
+            email: clientEmail,
+            key: privateKey,
+            scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+        });
+
+        const doc = new GoogleSpreadsheet(sheetId, serviceAccountAuth);
+        await doc.loadInfo();
+        const sheet = doc.sheetsByIndex[0];
+        const rows = await sheet.getRows();
+
+        const normalizedKey = normalizeText(searchKey);
+        const matches = rows.filter(row => {
+            // Adjust column names based on your sheet
+            const rowName = normalizeText(row.get('HỌ VÀ TÊN'));
+            const rowPhone = normalizeText(row.get('SDT'));
+            return rowName.includes(normalizedKey) || rowPhone.includes(normalizedKey);
+        });
+
+        if (matches.length > 0) {
+            let result = `🔍 Tìm thấy ${matches.length} kết quả cho "${searchKey}":\n\n`;
+            const limit = Math.min(matches.length, 5);
+
+            for (let i = 0; i < limit; i++) {
+                const m = matches[i];
+                const data = m.toObject();
+                console.log("📄 Sheet Row Data:", JSON.stringify(data));
+
+                // Helper to get value regardless of case/spaces in header
+                const getVal = (possibleNames) => {
+                    for (const name of possibleNames) {
+                        const key = Object.keys(data).find(k => normalizeText(k) === normalizeText(name));
+                        if (key && data[key]) return data[key];
+                    }
+                    return '---';
+                };
+
+                result += `👤 ${getVal(['HỌ VÀ TÊN', 'Tên', 'Name'])}\n`;
+                result += `📅 ${getVal(['NĂM SINH', 'Năm', 'Year'])}\n`;
+                result += `💳 ${getVal(['CMND', 'CCCD', 'ID'])}\n`;
+                result += `📞 ${getVal(['SDT', 'SĐT', 'Phone'])}\n`;
+                result += `📍 ${getVal(['ĐỊA CHỈ', 'Địa chỉ', 'Address'])}\n`;
+                result += `📝 ${getVal(['N1', 'CHÚ THÍCH', 'Ghi chú', 'Note', 'Thông tin thêm'])}\n`;
+                result += `======================================\n`;
+            }
+
+            if (matches.length > limit) {
+                result += `*(Vẫn còn ${matches.length - limit} kết quả khác)*`;
+            }
+            return result.trim();
+        } else {
+            return `❌ Không tìm thấy thông tin nào cho "${searchKey}".`;
+        }
+    } catch (err) {
+        console.error('Google Sheets Error:', err.message);
+        return `⚠️ Lỗi tra cứu dữ liệu: ${err.message}`;
+    }
+}
 async function startBot(api) {
     zaloApi = api;
     botStatus = 'connected';
@@ -45,31 +127,46 @@ async function startBot(api) {
     }
 
     api.listener.on("message", async (message) => {
+        console.log("📩 New Message:", JSON.stringify(message));
+
+        const targetId = String(message.threadId);
+        const senderId = String(message.data.uidFrom || message.data.senderId || message.threadId);
+
+        // Foolproof Group Detection: If threadId != senderId, it MUST be a group
+        const isGroup = targetId !== senderId;
+
+        console.log(`🎯 Detected: ${isGroup ? 'GROUP' : 'PRIVATE'} | Thread: ${targetId} | Sender: ${senderId}`);
+
         const isPlainText = typeof message.data.content === "string";
-        const text = isPlainText ? message.data.content : "";
-        const senderId = message.data.uidFrom || message.data.senderId;
-        
-        if (isPlainText && text) {
+        const text = isPlainText ? message.data.content : (message.data.content?.text || "");
+
+        if (text) {
             let reply = "";
             if (text.toLowerCase().startsWith("check ")) {
-                reply = `🔍 Bot đã nhận lệnh kiểm tra cho tham số: ${text.substring(6).trim()}`;
+                const param = text.substring(6).trim();
+                reply = await searchGoogleSheet(param);
             } else if (text.toLowerCase() === "ping") {
                 reply = "pong!";
             }
 
             if (reply) {
                 try {
-                    await api.sendMessage({ msg: reply }, senderId, message.threadType);
+                    await api.sendMessage(
+                        { msg: reply },
+                        targetId,
+                        isGroup ? ThreadType.Group : ThreadType.User
+                    );
+                    console.log(`✅ Sent reply to ${isGroup ? 'Group' : 'User'}: ${targetId}`);
                 } catch (err) {
-                    console.error("Send message error:", err);
+                    console.error(`❌ Failed to send reply to ${targetId}: ${err.message}`);
                 }
             }
         }
-        
+
         io.emit('new_message', {
             sender: senderId,
             text: text,
-            timestamp: new Date().toISOString()
+            isGroup: isGroup
         });
     });
 
@@ -87,7 +184,7 @@ async function login() {
         console.log("Attempting to restore session from Redis...");
         cookie = await redis.get('zalo_session');
     }
-    
+
     if (!cookie && fs.existsSync(SESSION_FILE)) {
         console.log("Attempting to restore session from local file...");
         cookie = JSON.parse(fs.readFileSync(SESSION_FILE, 'utf-8'));
