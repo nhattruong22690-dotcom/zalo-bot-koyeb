@@ -6,6 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const dotenv = require('dotenv');
 const next = require('next');
+const { Redis } = require('@upstash/redis');
 
 dotenv.config();
 
@@ -15,6 +16,14 @@ const handle = nextApp.getRequestHandler();
 
 const PORT = process.env.PORT || 3000;
 const SESSION_FILE = path.join(__dirname, 'session.json');
+
+// Initialize Redis if credentials exist
+const redis = (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) 
+    ? new Redis({
+        url: process.env.UPSTASH_REDIS_REST_URL,
+        token: process.env.UPSTASH_REDIS_REST_TOKEN,
+    }) 
+    : null;
 
 let zaloApi = null;
 let botStatus = 'disconnected';
@@ -26,7 +35,14 @@ async function startBot(api) {
     io.emit('status', { status: botStatus });
 
     const cookie = api.getCookie();
-    fs.writeFileSync(SESSION_FILE, JSON.stringify(cookie));
+    // Save to Redis if available, else local file
+    if (redis) {
+        await redis.set('zalo_session', JSON.stringify(cookie));
+        console.log("Session saved to Redis");
+    } else {
+        fs.writeFileSync(SESSION_FILE, JSON.stringify(cookie));
+        console.log("Session saved to local file");
+    }
 
     api.listener.on("message", async (message) => {
         const isPlainText = typeof message.data.content === "string";
@@ -65,9 +81,20 @@ async function login() {
     io.emit('status', { status: botStatus });
     const zalo = new Zalo();
 
-    if (fs.existsSync(SESSION_FILE)) {
+    // Try to restore session from Redis first, then local file
+    let cookie = null;
+    if (redis) {
+        console.log("Attempting to restore session from Redis...");
+        cookie = await redis.get('zalo_session');
+    }
+    
+    if (!cookie && fs.existsSync(SESSION_FILE)) {
+        console.log("Attempting to restore session from local file...");
+        cookie = JSON.parse(fs.readFileSync(SESSION_FILE, 'utf-8'));
+    }
+
+    if (cookie) {
         try {
-            const cookie = JSON.parse(fs.readFileSync(SESSION_FILE, 'utf-8'));
             const api = await zalo.loginCookie(cookie);
             await startBot(api);
             return;
@@ -112,7 +139,8 @@ nextApp.prepare().then(() => {
         socket.emit('status', { status: botStatus });
         if (qrData) socket.emit('qr', { qr: qrData });
         socket.on('login', () => botStatus === 'disconnected' && login());
-        socket.on('logout', () => {
+        socket.on('logout', async () => {
+            if (redis) await redis.del('zalo_session');
             if (fs.existsSync(SESSION_FILE)) fs.unlinkSync(SESSION_FILE);
             process.exit(0);
         });
