@@ -202,6 +202,73 @@ async function trackOrder247(orderCode) {
     }
 }
 
+async function getOrderList247(showAll = false) {
+    try {
+        const clientId = process.env.GH247_CLIENT_ID;
+        const token = process.env.GH247_TOKEN;
+        if (!clientId || !token) return "⚠️ Chưa cấu hình ClientID/Token cho 247Express.";
+
+        const url = 'https://customer-api.247express.vn/api/Order/SearchCPNOrders';
+        const fromDate = new Date();
+        fromDate.setDate(fromDate.getDate() - 30);
+
+        const payload = {
+            "ClientHubID": 0,
+            "ClientID": parseInt(clientId),
+            "FromDate": fromDate.toISOString().split('.')[0],
+            "ToDate": new Date().toISOString().split('.')[0],
+            "IsFilterTotalCost": true,
+            "MaxTotalCost": 0,
+            "MinTotalCost": 0,
+            "OrderType": null,
+            "PageIndex": 0,
+            "PageSize": 50,
+            "Status": null,
+            "TextSearch": ""
+        };
+
+        const res = await fetch(url, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'ClientID': clientId,
+                'token': token
+            },
+            body: JSON.stringify(payload)
+        });
+
+        const d = await res.json();
+        if (d.errorCode) throw new Error(d.errorMessage || d.message);
+
+        let orders = d.orders || [];
+        if (!showAll) {
+            orders = orders.filter(o => o.status != "30");
+        }
+
+        if (orders.length === 0) {
+            return showAll ? "📭 Không tìm thấy đơn hàng nào." : "✅ Tất cả đơn hàng đã giao thành công!";
+        }
+
+        let table = "```\n";
+        table += "STT | MÃ ĐƠN      | TRẠNG THÁI     | ĐÍCH ĐẾN\n";
+        table += "----+-------------+----------------+------------\n";
+        orders.slice(0, 30).forEach((o, i) => {
+            const id = (i + 1).toString().padEnd(3);
+            const code = o.orderCode.padEnd(11);
+            const status = (o.status == "30") ? "Thành công" : (o.statusName || '---').substring(0, 14);
+            const province = (o.receiverProvinceName || '---').substring(0, 10);
+            table += `${id} | ${code} | ${status.padEnd(14)} | ${province}\n`;
+        });
+        table += "```";
+
+        const title = showAll ? "📋 TẤT CẢ ĐƠN HÀNG (30 ngày)" : "🚚 ĐƠN HÀNG ĐANG GIAO";
+        return `${title}\n${table}${orders.length > 30 ? "\n*(Chỉ hiện 30 đơn gần nhất)*" : ""}`;
+    } catch (err) {
+        console.error('247 List Error:', err.message);
+        return `⚠️ Lỗi lấy danh sách: ${err.message}`;
+    }
+}
+
 async function startBot(api) {
     zaloApi = api;
     botStatus = 'connected';
@@ -239,6 +306,9 @@ async function startBot(api) {
             } else if (text.toLowerCase().startsWith("tracking ")) {
                 const orderCode = text.substring(9).trim();
                 reply = await trackOrder247(orderCode);
+            } else if (text.toLowerCase().startsWith("danh sach")) {
+                const showAll = text.toLowerCase().includes("tat ca");
+                reply = await getOrderList247(showAll);
             } else if (text.toLowerCase() === "ping") {
                 reply = "pong!";
             }
