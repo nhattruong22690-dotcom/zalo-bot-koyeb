@@ -195,8 +195,23 @@ async function trackOrder247(orderCode) {
 
     const fmtDate = (iso) => {
         if (!iso) return '';
-        const dt = new Date(iso);
-        return `${dt.getDate().toString().padStart(2, '0')}/${(dt.getMonth() + 1).toString().padStart(2, '0')} ${dt.getHours().toString().padStart(2, '0')}:${dt.getMinutes().toString().padStart(2, '0')}`;
+        try {
+            const dt = new Date(iso);
+            // Ép múi giờ Việt Nam (GMT+7)
+            const formatter = new Intl.DateTimeFormat('vi-VN', {
+                timeZone: 'Asia/Ho_Chi_Minh',
+                day: '2-digit',
+                month: '2-digit',
+                hour: '2-digit',
+                minute: '2-digit',
+                hour12: false
+            });
+            const parts = formatter.formatToParts(dt);
+            const find = (type) => parts.find(p => p.type === type).value;
+            return `${find('day')}/${find('month')} ${find('hour')}:${find('minute')}`;
+        } catch (e) {
+            return iso;
+        }
     };
 
     const isDelivered = d.status === '30' || d.statusName === 'PHATTHANHCONG';
@@ -429,8 +444,13 @@ async function saveOrderToSheets(orderData) {
         const nextSeq = existingInPeriod.length + 1;
         const orderId = `${periodPrefix}-${nextSeq}`;
         const now = new Date();
-        const timestamp = now.toLocaleString('vi-VN');
-        const exportTime = orderData.exportTime || `${now.getDate().toString().padStart(2, '0')}/${(now.getMonth() + 1).toString().padStart(2, '0')}/${now.getFullYear()} ${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
+        const timestamp = now.toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' });
+        
+        // Format exportTime as DD/MM/YYYY HH:mm in VN timezone
+        const vnOptions = { timeZone: 'Asia/Ho_Chi_Minh', day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false };
+        const vnFmt = new Intl.DateTimeFormat('vi-VN', vnOptions).formatToParts(now);
+        const getV = (t) => vnFmt.find(p => p.type === t).value;
+        const exportTime = orderData.exportTime || `${getV('day')}/${getV('month')}/${getV('year')} ${getV('hour')}:${getV('minute')}`;
 
         await summarySheet.addRow({
             'OrderID': orderId,
