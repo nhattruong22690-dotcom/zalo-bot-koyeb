@@ -565,6 +565,20 @@ async function startBot(api) {
         // --- NEW: Menu Mode Logic ---
         const currentState = userState.get(stateKey);
 
+        // --- Global Exit Command (Context-Aware) ---
+        const exitKeywords = ['thoat', 'tat', 'exit', 'stop', 'quit'];
+        if (exitKeywords.includes(text.toLowerCase().trim())) {
+            let exitMsg = "👋 Đã thoát chế độ Menu.";
+            if (currentState && currentState.startsWith('BOT247_')) {
+                exitMsg = "🤖 BOT247 đã dừng.";
+            } else if (currentState === 'MENU') {
+                exitMsg = "🤖 Menu đã dừng.";
+            }
+            userState.delete(stateKey);
+            await api.sendMessage({ msg: exitMsg + " Nhắn 'menu' hoặc 'bot247' để bắt đầu lại." }, targetId, isGroup ? ThreadType.Group : ThreadType.User);
+            return;
+        }
+
         // Handle 'menu' or 'start' command, or '0' only if NO state is active
         if (text.toLowerCase() === 'menu' || text.toLowerCase() === 'start' || (text === '0' && !currentState)) {
             userState.set(stateKey, 'MENU');
@@ -609,9 +623,9 @@ async function startBot(api) {
                 userState.delete(stateKey);
                 return;
             } else if (text === '0') {
-                text = 'menu';
+                text = 'menu'; // Refresh main menu
             } else if (/^\d+$/.test(text)) {
-                await api.sendMessage({ msg: "⚠️ Lựa chọn không hợp lệ. Vui lòng chọn số từ 1 đến 6, hoặc nhắn '0' để làm mới Menu." }, targetId, isGroup ? ThreadType.Group : ThreadType.User);
+                await api.sendMessage({ msg: "⚠️ Lựa chọn không hợp lệ. Vui lòng chọn số từ 1 đến 6, hoặc nhắn 'thoat' để dừng Bot." }, targetId, isGroup ? ThreadType.Group : ThreadType.User);
                 return;
             }
         }
@@ -627,9 +641,9 @@ async function startBot(api) {
                 await api.sendMessage({ msg: "🔍 Mời bạn nhập Mã Vận Đơn (11 chữ số) để tra cứu.\n👉 Nhắn '0' để quay lại Menu bot247." }, targetId, isGroup ? ThreadType.Group : ThreadType.User);
                 return;
             } else if (text === '0') {
-                text = 'bot247';
+                text = 'bot247'; // Refresh BOT247 menu
             } else if (/^\d+$/.test(text)) {
-                await api.sendMessage({ msg: "⚠️ Lựa chọn không hợp lệ. Vui lòng chọn số từ 1 đến 3, hoặc nhắn '0' để quay lại." }, targetId, isGroup ? ThreadType.Group : ThreadType.User);
+                await api.sendMessage({ msg: "⚠️ Lựa chọn không hợp lệ. Vui lòng chọn số từ 1 đến 3, hoặc nhắn 'thoat' để dừng BOT247." }, targetId, isGroup ? ThreadType.Group : ThreadType.User);
                 return;
             }
         }
