@@ -671,7 +671,7 @@ async function startBot(api) {
                 exitMsg = "🤖 Menu đã dừng.";
             }
             userState.delete(stateKey);
-            await api.sendMessage({ msg: exitMsg + " Nhắn 'menu' hoặc 'bot247' để bắt đầu lại." }, targetId, isGroup ? ThreadType.Group : ThreadType.User);
+            await api.sendMessage({ msg: exitMsg }, targetId, isGroup ? ThreadType.Group : ThreadType.User);
             return;
         }
 
