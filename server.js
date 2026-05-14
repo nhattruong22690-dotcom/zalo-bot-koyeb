@@ -140,13 +140,49 @@ const STATUS_MAP_247 = {
 
 async function trackOrder247(orderCode) {
     const apiKey = process.env.GH247_API_KEY;
+    const clientId = process.env.GH247_CLIENT_ID;
+    const token = process.env.GH247_TOKEN;
+
     if (!apiKey) return '⚠️ Chưa có GH247_API_KEY trong .env';
 
+    let address = '';
+    let totalFee = 0;
+
+    // --- Phase 1: Try to get detailed info from Internal Search API (for Address and Cost) ---
+    if (clientId && token) {
+        try {
+            const searchUrl = 'https://customer-api.247express.vn/api/Order/SearchCPNOrders';
+            const searchPayload = {
+                "ClientID": parseInt(clientId),
+                "OrderCode": orderCode,
+                "FromDate": "2026-01-01T00:00:00", // Wide range to find the order
+                "ToDate": "2026-12-31T23:59:59"
+            };
+            const searchRes = await fetch(searchUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'ClientID': clientId, 'token': token },
+                body: JSON.stringify(searchPayload)
+            });
+            const searchData = await searchRes.json();
+            if (searchData.orders && searchData.orders.length > 0) {
+                const o = searchData.orders[0];
+                address = o.receiverAddress || '';
+                totalFee = o.totalCost || 0;
+            }
+        } catch (e) {
+            console.error("Lỗi fetch SearchCPNOrders:", e.message);
+        }
+    }
+
+    // --- Phase 2: Get Tracking Info (for Status and Journey) ---
     const url = `https://tracking.247express.vn/api/Order/v1/Tracking?ordercode=${encodeURIComponent(orderCode)}&apikey=${apiKey}`;
     const res = await fetch(url);
     const d = await res.json();
 
     if (d.errorCode || !d.orderCode) return `❌ Không tìm thấy đơn hàng "${orderCode}".`;
+
+    // Use totalServiceCost from tracking if search API didn't provide it
+    if (!totalFee) totalFee = d.totalServiceCost || 0;
 
     const latestStatus = d.statuses && d.statuses.length > 0 ? d.statuses[d.statuses.length - 1] : null;
     const statusLabel = latestStatus ? (STATUS_MAP_247[latestStatus.statusName] || latestStatus.trackingName) : '---';
@@ -157,18 +193,26 @@ async function trackOrder247(orderCode) {
         return `${dt.getDate().toString().padStart(2, '0')}/${(dt.getMonth() + 1).toString().padStart(2, '0')} ${dt.getHours().toString().padStart(2, '0')}:${dt.getMinutes().toString().padStart(2, '0')}`;
     };
 
+    const isDelivered = d.status === '30' || d.statusName === 'PHATTHANHCONG';
+    const receiverLabel = isDelivered ? '📥 Người nhận thực tế' : '📥 Người nhận (theo bill)';
+
     let msg = `🔍 Vận đơn: ${d.orderCode}\n`;
     msg += `━━━━━━━━━━━━━━━━━━━\n`;
     msg += `📌 Trạng thái: ${statusLabel}\n`;
     if (d.realWeight) msg += `⚖️ Khối lượng: ${d.realWeight}g\n`;
-    if (d.receiverName) msg += `📥 Người nhận: ${d.receiverName}\n`;
+    if (d.quantity) msg += `📦 Số lượng kiện: ${d.quantity}\n`;
+    if (d.receiverName) msg += `${receiverLabel}: ${d.receiverName}\n`;
+    if (address) msg += `📍 Địa chỉ: ${address}\n`;
+    if (totalFee) msg += `💰 Tổng cước: ${Number(totalFee).toLocaleString('vi-VN')}đ\n`;
 
     if (Array.isArray(d.trackings) && d.trackings.length > 0) {
         msg += `\n📋 Hành trình:\n`;
-        const recent = d.trackings.slice(-3).reverse();
-        for (const t of recent) {
+        const allTrackings = [...d.trackings].reverse();
+        for (const t of allTrackings) {
             const icon = (STATUS_MAP_247[t.statusName] || STATUS_MAP_247[t.trackingName]) ? (STATUS_MAP_247[t.statusName] || STATUS_MAP_247[t.trackingName]).split(' ')[0] : '▪️';
-            msg += `${icon} ${t.statusName} - ${fmtDate(t.dateChange)}\n`;
+            const location = t.postOfficeName || t.provinceName || '';
+            const noteStr = t.notes ? ` (${t.notes})` : '';
+            msg += `${icon} ${t.statusName}${location ? ' tại ' + location : ''}${noteStr} - ${fmtDate(t.dateChange)}\n`;
         }
     }
 
@@ -518,8 +562,11 @@ async function startBot(api) {
         const isPlainText = typeof message.data.content === "string";
         let text = isPlainText ? message.data.content : (message.data.content?.text || message.data.content?.title || "");
 
-        // Handle 'menu' or 'start' command
-        if (text.toLowerCase() === 'menu' || text.toLowerCase() === 'start' || text === '0') {
+        // --- NEW: Menu Mode Logic ---
+        const currentState = userState.get(stateKey);
+
+        // Handle 'menu' or 'start' command, or '0' only if NO state is active
+        if (text.toLowerCase() === 'menu' || text.toLowerCase() === 'start' || (text === '0' && !currentState)) {
             userState.set(stateKey, 'MENU');
             let reply = "🤖 CHÀO MỪNG BẠN ĐẾN VỚI MENU ĐIỀU KHIỂN 🤖\n\n";
             reply += "Vui lòng nhắn số tương ứng với lệnh bạn muốn:\n";
@@ -538,8 +585,6 @@ async function startBot(api) {
             return;
         }
 
-        // --- NEW: Menu Mode Logic ---
-        const currentState = userState.get(stateKey);
         if (currentState === 'MENU') {
             if (text === '1') {
                 userState.delete(stateKey); 
@@ -565,6 +610,9 @@ async function startBot(api) {
                 return;
             } else if (text === '0') {
                 text = 'menu';
+            } else if (/^\d+$/.test(text)) {
+                await api.sendMessage({ msg: "⚠️ Lựa chọn không hợp lệ. Vui lòng chọn số từ 1 đến 6, hoặc nhắn '0' để làm mới Menu." }, targetId, isGroup ? ThreadType.Group : ThreadType.User);
+                return;
             }
         }
 
@@ -575,10 +623,22 @@ async function startBot(api) {
             } else if (text === '2') {
                 text = 'danhsach all';
             } else if (text === '3') {
-                await api.sendMessage({ msg: "🔍 Để tra cứu chi tiết, bạn hãy nhắn trực tiếp [Mã Vận Đơn].\nVí dụ: 90062162865" }, targetId, isGroup ? ThreadType.Group : ThreadType.User);
+                userState.set(stateKey, 'BOT247_SEARCH');
+                await api.sendMessage({ msg: "🔍 Mời bạn nhập Mã Vận Đơn (11 chữ số) để tra cứu.\n👉 Nhắn '0' để quay lại Menu bot247." }, targetId, isGroup ? ThreadType.Group : ThreadType.User);
                 return;
             } else if (text === '0') {
                 text = 'bot247';
+            } else if (/^\d+$/.test(text)) {
+                await api.sendMessage({ msg: "⚠️ Lựa chọn không hợp lệ. Vui lòng chọn số từ 1 đến 3, hoặc nhắn '0' để quay lại." }, targetId, isGroup ? ThreadType.Group : ThreadType.User);
+                return;
+            }
+        }
+        
+        // --- BOT247 Search Logic ---
+        if (currentState === 'BOT247_SEARCH') {
+            if (text === '0') {
+                text = 'bot247';
+                userState.set(stateKey, 'BOT247_MENU');
             }
         }
         // --- END: BOT247 Sub-Menu Logic ---
@@ -871,8 +931,9 @@ async function startBot(api) {
                 return;
             }
 
-            // Check if text is a 247 tracking code (e.g., 90062162865) - 11 digits
-            if (/^\d{11}$/.test(text)) {
+            // Check if text is a 247 tracking code
+            // RESTRICTED: Only search if in BOT247_SEARCH state, and accept any characters
+            if (currentState === 'BOT247_SEARCH' && text !== '0' && text !== '') {
                 try {
                     const result = await trackOrder247(text);
                     await api.sendMessage({ msg: result + "\n\n👉 Nhắn '0' để quay lại Menu." }, targetId, isGroup ? ThreadType.Group : ThreadType.User);
@@ -961,7 +1022,8 @@ async function startBot(api) {
             } else if (text.toLowerCase().startsWith("tracking ")) {
                 const orderCode = text.substring(9).trim();
                 const res = await trackOrder247(orderCode);
-                reply = res + "\n\n👉 Nhắn '0' để quay lại Menu.";
+                await api.sendMessage({ msg: res + "\n\n👉 Nhắn '0' để quay lại Menu." }, targetId, isGroup ? ThreadType.Group : ThreadType.User);
+                return;
             } else if (text.toLowerCase().startsWith("danh sach")) {
                 const showAll = text.toLowerCase().includes("tat ca");
                 const res = await getOrderList247(showAll);
