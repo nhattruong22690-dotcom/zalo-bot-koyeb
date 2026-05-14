@@ -34,6 +34,12 @@ const redis = (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_R
     })
     : null;
 
+// Background tracking interval (30 minutes)
+let autoTrackingTimer = null;
+const NOTIFY_GROUP_KEY = 'config:notify_group_id';
+const NOTIFY_TYPE_KEY = 'config:notify_group_type';
+const TRACKING_PREFIX = 'track:247:status:';
+
 let zaloApi = null;
 let botStatus = 'disconnected';
 let qrData = null;
@@ -121,12 +127,12 @@ async function searchGoogleSheet(searchKey) {
 
 // --- 247Express Helper Functions ---
 const STATUS_MAP_247 = {
-    'DATIEPNHAN': '📦 Đã tiếp nhận',
-    'Nhập hệ thống': '📦 Đã tiếp nhận',
-    'DALAYHANG': '🚚 Đã lấy hàng',
-    'Đã lấy hàng': '🚚 Đã lấy hàng',
-    'DANGVANCHUYEN': '🔄 Đang vận chuyển',
-    'Đang vận chuyển': '🔄 Đang vận chuyển',
+    'DATIEPNHAN': '📝 Đã tiếp nhận',
+    'Nhập hệ thống': '📝 Đã tiếp nhận',
+    'DALAYHANG': '📦 Đã lấy hàng',
+    'Đã lấy hàng': '📦 Đã lấy hàng',
+    'DANGVANCHUYEN': '🚚 Đang vận chuyển',
+    'Đang vận chuyển': '🚚 Đang vận chuyển',
     'Đóng gói': '📦 Đang đóng gói',
     'Đến bưu cục': '🏬 Đã đến bưu cục',
     'Giao bưu tá phát': '🛵 Giao bưu tá',
@@ -222,7 +228,7 @@ async function trackOrder247(orderCode) {
     return msg.trim();
 }
 
-async function getOrderList247(showAll = false) {
+async function getOrderList247(showAll = false, fromDate = '2026-01-01T00:00:00', toDate = '2026-12-31T23:59:59') {
     const clientId = process.env.GH247_CLIENT_ID;
     const token = process.env.GH247_TOKEN;
     if (!clientId || !token) return '⚠️ Thiếu GH247_CLIENT_ID hoặc TOKEN trong .env';
@@ -230,32 +236,122 @@ async function getOrderList247(showAll = false) {
     const url = 'https://customer-api.247express.vn/api/Order/SearchCPNOrders';
     const payload = {
         "ClientHubID": 0, "ClientID": parseInt(clientId), "PageIndex": 0, "PageSize": 50,
-        "FromDate": "2026-05-01T00:00:00", "ToDate": "2026-12-31T23:59:59"
+        "FromDate": fromDate,
+        "ToDate": toDate
     };
 
-    const res = await fetch(url, {
-        method: 'POST', headers: { 'Content-Type': 'application/json', 'ClientID': clientId, 'token': token },
-        body: JSON.stringify(payload)
-    });
-    const data = await res.json();
-    
-    if (res.ok && !data.errorCode) {
-        let orders = data.orders || [];
-        if (!showAll) {
-            orders = orders.filter(o => o.status != "30"); // Only ongoing orders
+    let attempts = 0;
+    while (attempts < 2) {
+        try {
+            const res = await fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'ClientID': clientId, 'token': token },
+                body: JSON.stringify(payload)
+            });
+            const data = await res.json();
+            
+            if (res.ok && !data.errorCode) {
+                let orders = data.orders || [];
+                if (!showAll) {
+                    orders = orders.filter(o => o.status != "30"); // Chỉ đơn đang giao
+                }
+
+                if (orders.length === 0) return showAll ? "📭 Hiện chưa có vận đơn nào." : "✅ Tất cả đơn hàng đã giao thành công!";
+                
+                let reply = showAll ? `📋 TẤT CẢ VẬN ĐƠN 247\n` : `🚚 ĐƠN HÀNG ĐANG GIAO\n`;
+                reply += `━━━━━━━━━━━━━━━━━━━\n`;
+                orders.slice(0, 15).forEach((o, i) => {
+                    const rawStatus = (o.status == "30") ? "✅ Thành công" : (o.statusName || '---');
+                    const status = STATUS_MAP_247[rawStatus] || rawStatus; // Áp dụng icon nếu có
+                    const receiver = o.receiverName || '---';
+                    const address = o.receiverAddress || o.receiverProvinceName || '---';
+                    reply += `${i + 1}. ${o.orderCode} - ${receiver} - ${address} - ${status}\n\n`;
+                });
+                return reply.trim();
+            }
+            return `❌ Lỗi từ API: ${data.errorMessage || 'Không thể lấy danh sách'}`;
+        } catch (err) {
+            attempts++;
+            console.error(`❌ Lỗi lấy danh sách (Lần ${attempts}):`, err.message);
+            if (attempts >= 2) throw err;
+            await new Promise(r => setTimeout(r, 1000)); // Thử lại sau 1s
+        }
+    }
+}
+
+async function runAutoTracking(api) {
+    if (!redis) {
+        console.log("⚠️ Redis not configured. Auto-tracking disabled.");
+        return;
+    }
+
+    try {
+        const targetGroupId = await redis.get(NOTIFY_GROUP_KEY);
+        const targetType = await redis.get(NOTIFY_TYPE_KEY) || ThreadType.Group;
+        if (!targetGroupId) {
+            console.log("ℹ️ No notification target set. Use 'setnotify' in a chat.");
+            return;
         }
 
-        if (orders.length === 0) return showAll ? "📭 Hiện chưa có vận đơn nào." : "✅ Tất cả đơn hàng đã giao thành công!";
+        console.log("🕒 Running auto-tracking scan...");
+        // Get orders for current month
+        const now = new Date();
+        const fromDate = `${now.getFullYear()}-${(now.getMonth() + 1).toString().padStart(2, '0')}-01T00:00:00`;
+        const toDate = `${now.getFullYear()}-${(now.getMonth() + 1).toString().padStart(2, '0')}-31T23:59:59`;
         
-        let reply = showAll ? `📋 TẤT CẢ VẬN ĐƠN 247\n` : `🚚 ĐƠN HÀNG ĐANG GIAO\n`;
-        reply += `━━━━━━━━━━━━━━━━━━━\n`;
-        orders.slice(0, 15).forEach((o, i) => {
-            const status = (o.status == "30") ? "✅ Thành công" : (o.statusName || '---');
-            reply += `${i + 1}. ${o.orderCode} | ${status}\n📍 ${o.receiverProvinceName || '---'}\n\n`;
+        const clientId = process.env.GH247_CLIENT_ID;
+        const token = process.env.GH247_TOKEN;
+        const url = 'https://customer-api.247express.vn/api/Order/SearchCPNOrders';
+        const payload = {
+            "ClientHubID": 0, "ClientID": parseInt(clientId), "PageIndex": 0, "PageSize": 100,
+            "FromDate": fromDate, "ToDate": toDate
+        };
+
+        const res = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'ClientID': clientId, 'token': token },
+            body: JSON.stringify(payload)
         });
-        return reply.trim();
+        const data = await res.json();
+
+        if (res.ok && data.orders) {
+            console.log(`📦 Found ${data.orders.length} orders in month ${now.getMonth() + 1}/${now.getFullYear()}`);
+            let changeCount = 0;
+
+            for (const o of data.orders) {
+                const orderCode = o.orderCode;
+                const currentStatus = o.statusName || '---';
+                const redisKey = `${TRACKING_PREFIX}${orderCode}`;
+                
+                const oldStatus = await redis.get(redisKey);
+                
+                if (oldStatus && oldStatus !== currentStatus) {
+                    changeCount++;
+                    // Status changed! Notify.
+                    const icon = (STATUS_MAP_247[currentStatus]) ? STATUS_MAP_247[currentStatus].split(' ')[0] : '🔔';
+                    let msg = `🔔 **CẬP NHẬT ĐƠN HÀNG**\n`;
+                    msg += `━━━━━━━━━━━━━━━━━━━\n`;
+                    msg += `📦 Mã đơn: ${orderCode}\n`;
+                    msg += `👤 Người nhận: ${o.receiverName || '---'}\n`;
+                    msg += `🔄 Trạng thái: ${icon} ${currentStatus}\n`;
+                    msg += `📍 Vị trí: ${o.receiverProvinceName || '---'}\n`;
+                    msg += `━━━━━━━━━━━━━━━━━━━\n`;
+                    msg += `👉 Nhắn mã đơn để xem chi tiết hành trình.`;
+
+                    await api.sendMessage({ msg }, targetGroupId, targetType == 'Group' ? ThreadType.Group : ThreadType.User);
+                    console.log(`✅ NOTIFIED: ${orderCode} (${oldStatus} -> ${currentStatus})`);
+                }
+                
+                // Update Redis with current status
+                await redis.set(redisKey, currentStatus, { ex: 60 * 60 * 24 * 7 });
+            }
+            console.log(`🏁 Scan finished. Detected ${changeCount} changes.`);
+        } else {
+            console.log("❌ No orders found or API error:", data.errorMessage);
+        }
+    } catch (err) {
+        console.error("❌ Auto-tracking error:", err.message);
     }
-    return `❌ Lỗi: ${data.errorMessage || 'Không thể lấy danh sách'}`;
 }
 
 function parseOrderCommand(text) {
@@ -633,17 +729,35 @@ async function startBot(api) {
         // --- BOT247 Sub-Menu Logic ---
         if (currentState === 'BOT247_MENU') {
             if (text === '1') {
-                text = 'danhsach';
+                text = '__cmd_danhsach';
             } else if (text === '2') {
-                text = 'danhsach all';
+                text = '__cmd_danhsach all';
             } else if (text === '3') {
                 userState.set(stateKey, 'BOT247_SEARCH');
                 await api.sendMessage({ msg: "🔍 Mời bạn nhập Mã Vận Đơn (11 chữ số) để tra cứu.\n👉 Nhắn '0' để quay lại Menu bot247." }, targetId, isGroup ? ThreadType.Group : ThreadType.User);
                 return;
+            } else if (text === '4') {
+                userState.set(stateKey, 'BOT247_MONTH');
+                await api.sendMessage({ msg: "📅 Mời bạn nhập Tháng và Năm theo định dạng: [Tháng,Năm] (vd: 5,26)\n👉 Nhắn '0' để quay lại Menu bot247." }, targetId, isGroup ? ThreadType.Group : ThreadType.User);
+                return;
             } else if (text === '0') {
                 text = 'bot247'; // Refresh BOT247 menu
             } else if (/^\d+$/.test(text)) {
-                await api.sendMessage({ msg: "⚠️ Lựa chọn không hợp lệ. Vui lòng chọn số từ 1 đến 3, hoặc nhắn 'thoat' để dừng BOT247." }, targetId, isGroup ? ThreadType.Group : ThreadType.User);
+                await api.sendMessage({ msg: "⚠️ Lựa chọn không hợp lệ. Vui lòng chọn số từ 1 đến 4, hoặc nhắn 'thoat' để dừng BOT247." }, targetId, isGroup ? ThreadType.Group : ThreadType.User);
+                return;
+            }
+        }
+
+        // --- BOT247 Month Search Logic ---
+        if (currentState === 'BOT247_MONTH') {
+            if (text === '0') {
+                userState.set(stateKey, 'BOT247_MENU');
+                text = 'bot247'; // Refresh menu
+            } else if (/^\d{1,2},\d{2}$/.test(text)) {
+                text = `__cmd_danhsach ${text}`;
+                userState.set(stateKey, 'BOT247_MENU'); // Reset state after search
+            } else {
+                await api.sendMessage({ msg: "⚠️ Định dạng không đúng. Vui lòng nhập [Tháng,Năm] (vd: 5,26) hoặc nhắn '0' để quay lại." }, targetId, isGroup ? ThreadType.Group : ThreadType.User);
                 return;
             }
         }
@@ -907,6 +1021,27 @@ async function startBot(api) {
 
         if (text) {
             let reply = "";
+            if (text.toLowerCase() === 'setnotify') {
+                if (!redis) {
+                    reply = "⚠️ Redis chưa được cấu hình.";
+                } else {
+                    const type = isGroup ? 'Group' : 'User';
+                    await redis.set(NOTIFY_GROUP_KEY, targetId);
+                    await redis.set(NOTIFY_TYPE_KEY, type);
+                    reply = `✅ Đã thiết lập ${isGroup ? 'Nhóm' : 'Cá nhân'} này nhận thông báo tự động từ BOT247.\n🆔 ID: ${targetId}`;
+                }
+            }
+
+            if (text.toLowerCase() === 'testnotify') {
+                if (!redis) {
+                    reply = "⚠️ Redis chưa được cấu hình.";
+                } else {
+                    await api.sendMessage({ msg: "⏳ Đang quét kiểm tra thay đổi trạng thái đơn hàng..." }, targetId, isGroup ? ThreadType.Group : ThreadType.User);
+                    runAutoTracking(api);
+                    return;
+                }
+            }
+
             if (text.toLowerCase() === 'bot247') {
                 userState.set(stateKey, 'BOT247_MENU');
 
@@ -927,18 +1062,39 @@ async function startBot(api) {
                 m += `1️⃣  Xem vận đơn mới nhất (đang giao)\n`;
                 m += `2️⃣  Xem toàn bộ vận đơn (tất cả)\n`;
                 m += `3️⃣  Hướng dẫn tra cứu theo mã\n`;
+                m += `4️⃣  Tra cứu theo tháng (MM,YY)\n`;
                 m += `━━━━━━━━━━━━━━━━━━━\n`;
-                m += `💡 Gợi ý: Nhắn trực tiếp Mã Vận Đơn để xem ảnh bill.\n`;
-                m += `👉 Nhắn '0' để làm mới Menu này.`;
+                m += `💡 Gợi ý: Nhắn 'danhsach 5,26' để xem theo tháng.\n`;
                 await api.sendMessage({ msg: m }, targetId, isGroup ? ThreadType.Group : ThreadType.User);
                 return;
             }
 
-            if (text.toLowerCase() === 'danhsach' || text.toLowerCase() === 'danhsach all') {
+            if (text.toLowerCase().startsWith('__cmd_danhsach')) {
                 try {
+                    const parts = text.split(' ');
                     const showAll = text.toLowerCase().includes('all');
-                    const list = await getOrderList247(showAll);
-                    await api.sendMessage({ msg: list + "\n\n👉 Nhắn '0' để quay lại Menu." }, targetId, isGroup ? ThreadType.Group : ThreadType.User);
+                    
+                    // Pattern MM/YYYY or MM,YY
+                    const monthPart = parts.find(p => /^\d{1,2}\/\d{4}$/.test(p) || /^\d{1,2},\d{2}$/.test(p));
+                    let fromDate = '2026-01-01T00:00:00';
+                    let toDate = '2026-12-31T23:59:59';
+
+                    if (monthPart) {
+                        let m, y;
+                        if (monthPart.includes('/')) {
+                            [m, y] = monthPart.split('/');
+                        } else {
+                            const [mPart, yPart] = monthPart.split(',');
+                            m = mPart;
+                            y = `20${yPart}`; // vd: 26 -> 2026
+                        }
+                        const lastDay = new Date(parseInt(y), parseInt(m), 0).getDate();
+                        fromDate = `${y}-${m.padStart(2, '0')}-01T00:00:00`;
+                        toDate = `${y}-${m.padStart(2, '0')}-${lastDay}T23:59:59`;
+                    }
+
+                    const list = await getOrderList247(showAll, fromDate, toDate);
+                    await api.sendMessage({ msg: list + "\n\n👉 Nhắn '0' để quay lại Menu bot247." }, targetId, isGroup ? ThreadType.Group : ThreadType.User);
                 } catch (err) {
                     await api.sendMessage({ msg: `⚠️ Lỗi lấy danh sách: ${err.message}` }, targetId, isGroup ? ThreadType.Group : ThreadType.User);
                 }
@@ -1080,6 +1236,15 @@ async function startBot(api) {
     });
 
     api.listener.start();
+
+    // Start Auto-tracking background job
+    if (redis) {
+        console.log("🚀 Starting auto-tracking background job (30m interval)...");
+        // Run once at start
+        runAutoTracking(api);
+        // Then every 30 minutes
+        autoTrackingTimer = setInterval(() => runAutoTracking(api), 30 * 60 * 1000);
+    }
 }
 
 async function login() {
