@@ -1,0 +1,63 @@
+{
+  "allowAllByDefault": false,
+  "chats": {
+    "1823746557604864432": {
+      "threadId": "1823746557604864432",
+      "type": "USER",
+      "name": "Nhật",
+      "allowed": []
+    },
+    "2574832631006261060": {
+      "threadId": "2574832631006261060",
+      "type": "GROUP",
+      "name": "Bot's Home",
+      "allowed": [
+        "BOT247_TRACKING"
+      ]
+    },
+    "850517573849526578": {
+      "threadId": "850517573849526578",
+      "type": "USER",
+      "name": "Đức Vượng",
+      "allowed": [
+        "ignore"
+      ]
+    },
+    "4961356043207076133": {
+      "threadId": "4961356043207076133",
+      "type": "GROUP",
+      "name": "Nhóm (auto-detect)",
+      "allowed": [
+        "ignore"
+      ]
+    },
+    "3690149130887131849": {
+      "threadId": "3690149130887131849",
+      "type": "USER",
+      "name": "Phủi Nghệ An - Đặng Thành",
+      "allowed": [
+        "ignore"
+      ]
+    },
+    "7710669119108029950": {
+      "threadId": "7710669119108029950",
+      "type": "USER",
+      "name": "Dũng Hoàng",
+      "allowed": [
+        "ignore"
+      ]
+    },
+    "6954646363227821180": {
+      "threadId": "6954646363227821180",
+      "type": "GROUP",
+      "name": "Nhóm (auto-detect)",
+      "allowed": []
+    },
+    "3607273833977694960": {
+      "threadId": "3607273833977694960",
+      "type": "USER",
+      "name": "Dương Sỹ Cường",
+      "allowed": []
+    }
+  }
+}

@@ -14,10 +14,281 @@ const XLSX = require('xlsx');
 
 dotenv.config();
 
+let ignoredThreadIds = new Set();
+
 // Cache to store the last uploaded file for each user/group
 const lastFileCache = new Map();
-// Store user states (e.g., 'MENU', 'WAITING_FILE')
-const userState = new Map();
+// Store user states (e.g., 'MENU', 'WAITING_FILE') with automatic 5-minute timeout
+const userStateMap = new Map();
+const userState = {
+    get: (key) => {
+        const val = userStateMap.get(key);
+        if (!val) return null;
+        if (Date.now() - val.timestamp > 300000) { // 5 minutes (300,000 ms)
+            console.log(`⏰ State expired for key: ${key}`);
+            userStateMap.delete(key);
+            return null;
+        }
+        // Auto-renew timestamp on active access
+        val.timestamp = Date.now();
+        return val.state;
+    },
+    set: (key, state) => {
+        userStateMap.set(key, {
+            state: state,
+            timestamp: Date.now()
+        });
+    },
+    delete: (key) => {
+        userStateMap.delete(key);
+    },
+    has: (key) => {
+        return userState.get(key) !== null;
+    }
+};
+
+// --- NEW: RAM Log Buffer & Permissions Management ---
+const recentLogs = [];
+const MAX_LOGS = 100;
+const PERMISSIONS_FILE = path.join(__dirname, 'permissions.json');
+let permissionsConfig = { allowAllByDefault: true, chats: {} };
+const autoRegisteredIds = new Set(); // Track IDs already auto-added to sheet this session
+
+function loadPermissions() {
+    if (fs.existsSync(PERMISSIONS_FILE)) {
+        try {
+            permissionsConfig = JSON.parse(fs.readFileSync(PERMISSIONS_FILE, 'utf-8'));
+        } catch (e) {
+            console.error("Lỗi đọc permissions.json, dùng mặc định:", e.message);
+        }
+    } else {
+        fs.writeFileSync(PERMISSIONS_FILE, JSON.stringify(permissionsConfig, null, 2));
+    }
+}
+loadPermissions();
+
+async function loadPermissionsFromSheets() {
+    try {
+        const sheetId = process.env.GOOGLE_SHEET_ID;
+        const clientEmail = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
+        const privateKey = process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n');
+
+        if (!sheetId || !clientEmail || !privateKey) {
+            console.warn("⚠️ Google Sheets credentials not configured, permissions won't sync with Sheets.");
+            return;
+        }
+
+        const serviceAccountAuth = new JWT({
+            email: clientEmail,
+            key: privateKey,
+            scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+        });
+
+        const doc = new GoogleSpreadsheet(sheetId, serviceAccountAuth);
+        await doc.loadInfo();
+
+        let sheet = doc.sheetsByTitle['PhanQuyen'] || doc.sheetsByIndex.find(s => s.title.toLowerCase().trim() === 'phanquyen');
+        if (!sheet) {
+            console.log("📝 Không tìm thấy sheet 'PhanQuyen', đang khởi tạo sheet mới...");
+            sheet = await doc.addSheet({ title: 'PhanQuyen', headerValues: ['ThreadID', 'Type', 'Name', 'AllowedFeatures'] });
+            // Ghi cấu hình toàn cục mặc định
+            await sheet.addRow({ ThreadID: 'GLOBAL', Type: 'SYSTEM', Name: 'Global Allow All', AllowedFeatures: 'true' });
+        } else {
+            // Đảm bảo tiêu đề cột được nạp hoặc thiết lập chính xác
+            try {
+                await sheet.loadHeaderRow();
+            } catch (err) {
+                console.log("📝 Thiết lập tiêu đề cột cho sheet 'PhanQuyen'...");
+                await sheet.setHeaderRow(['ThreadID', 'Type', 'Name', 'AllowedFeatures']);
+            }
+        }
+
+        const rows = await sheet.getRows();
+
+        // Nếu sheet trống, đồng bộ cấu hình cục bộ hiện tại lên sheet thay vì ghi đè bằng cấu hình rỗng!
+        if (rows.length === 0) {
+            console.log("📝 Sheet 'PhanQuyen' trống, tự động đồng bộ cấu hình cục bộ hiện có lên Google Sheets...");
+            await savePermissionsToSheets(permissionsConfig);
+            return;
+        }
+
+        const newChats = {};
+        let allowAll = true;
+        const newIgnored = new Set();
+
+        for (const row of rows) {
+            const threadId = String(row.get('ThreadID') || '').trim();
+            const name = String(row.get('Name') || '').trim();
+            const allowedFeatures = String(row.get('AllowedFeatures') || '').trim();
+            const allowedClean = allowedFeatures.toLowerCase();
+
+            if (threadId === 'GLOBAL') {
+                allowAll = allowedClean === 'true';
+            } else if (threadId) {
+                if (allowedClean.includes('ignore') || allowedClean.includes('skip')) {
+                    newIgnored.add(threadId);
+                }
+                newChats[threadId] = {
+                    threadId: threadId,
+                    type: String(row.get('Type') || '').trim(),
+                    name: name,
+                    allowed: allowedFeatures.split(',').map(s => s.trim()).filter(Boolean)
+                };
+                autoRegisteredIds.add(threadId); // Mark as known
+            }
+        }
+
+        ignoredThreadIds = newIgnored;
+
+        permissionsConfig = {
+            allowAllByDefault: allowAll,
+            chats: newChats
+        };
+        console.log("✅ Đã đồng bộ phân quyền từ Google Sheet 'PhanQuyen' thành công!");
+
+        // Cập nhật lại cache file permissions.json cục bộ
+        fs.writeFileSync(PERMISSIONS_FILE, JSON.stringify(permissionsConfig, null, 2));
+    } catch (err) {
+        console.error("❌ Lỗi loadPermissionsFromSheets:", err.message);
+    }
+}
+
+async function savePermissionsToSheets(newConfig) {
+    try {
+        const sheetId = process.env.GOOGLE_SHEET_ID;
+        const clientEmail = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
+        const privateKey = process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n');
+
+        if (!sheetId || !clientEmail || !privateKey) {
+            console.warn("⚠️ Google Sheets credentials not configured, permissions won't save to Sheets.");
+            return;
+        }
+
+        const serviceAccountAuth = new JWT({
+            email: clientEmail,
+            key: privateKey,
+            scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+        });
+
+        const doc = new GoogleSpreadsheet(sheetId, serviceAccountAuth);
+        await doc.loadInfo();
+
+        let sheet = doc.sheetsByTitle['PhanQuyen'] || doc.sheetsByIndex.find(s => s.title.toLowerCase().trim() === 'phanquyen');
+        if (!sheet) {
+            sheet = await doc.addSheet({ title: 'PhanQuyen', headerValues: ['ThreadID', 'Type', 'Name', 'AllowedFeatures'] });
+        } else {
+            // Đảm bảo tiêu đề cột được nạp hoặc thiết lập chính xác trước khi clear/ghi
+            try {
+                await sheet.loadHeaderRow();
+            } catch (err) {
+                await sheet.setHeaderRow(['ThreadID', 'Type', 'Name', 'AllowedFeatures']);
+            }
+            // Xóa tất cả các dòng cũ để ghi đè dòng mới
+            await sheet.clearRows();
+        }
+
+        const rowsToAdd = [];
+        // 1. Thêm cấu hình toàn cục
+        rowsToAdd.push({
+            ThreadID: 'GLOBAL',
+            Type: 'SYSTEM',
+            Name: 'Global Allow All',
+            AllowedFeatures: String(newConfig.allowAllByDefault)
+        });
+
+        // 2. Thêm từng nhóm/kênh chat
+        for (const [threadId, chat] of Object.entries(newConfig.chats)) {
+            rowsToAdd.push({
+                ThreadID: threadId,
+                Type: chat.type || '',
+                Name: chat.name,
+                AllowedFeatures: (chat.allowed || []).join(',')
+            });
+        }
+
+        if (rowsToAdd.length > 0) {
+            await sheet.addRows(rowsToAdd);
+        }
+
+        console.log("✅ Đã ghi đè phân quyền lên Google Sheet 'PhanQuyen' thành công!");
+    } catch (err) {
+        console.error("❌ Lỗi savePermissionsToSheets:", err.message);
+    }
+}
+
+async function autoRegisterToSheet(id, type, name) {
+    try {
+        const sheetId = process.env.GOOGLE_SHEET_ID;
+        const clientEmail = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
+        const privateKey = process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n');
+        if (!sheetId || !clientEmail || !privateKey) return;
+
+        const serviceAccountAuth = new JWT({
+            email: clientEmail,
+            key: privateKey,
+            scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+        });
+        const doc = new GoogleSpreadsheet(sheetId, serviceAccountAuth);
+        await doc.loadInfo();
+        let sheet = doc.sheetsByTitle['PhanQuyen'];
+        if (!sheet) return;
+        await sheet.loadHeaderRow();
+
+        await sheet.addRow({
+            ThreadID: id,
+            Type: type,
+            Name: name,
+            AllowedFeatures: ''
+        });
+
+        // Also add to local config
+        permissionsConfig.chats[id] = { threadId: id, type: type, name: name, allowed: [] };
+        autoRegisteredIds.add(id);
+        console.log(`📋 Auto-registered ${type} '${name}' (${id}) to PhanQuyen sheet`);
+    } catch (err) {
+        console.error(`❌ autoRegisterToSheet error:`, err.message);
+    }
+}
+
+function checkThreadPermission(threadId, cmdText, senderId) {
+    const chatConfig = permissionsConfig.chats[threadId];
+    const isGroup = senderId && threadId !== senderId;
+
+    const cmd = cmdText.toLowerCase().trim();
+    if (!cmd) return false; // Empty command -> deny
+
+    let requiredFeature = null;
+
+    if (cmd === 'menu' || cmd === 'start' || cmd === 'taodon' || cmd.startsWith('sua ') || cmd.startsWith('xem ') || cmd.includes('nhap ') || cmd.startsWith('chitiet ') || cmd === 'tinhtrang') {
+        requiredFeature = 'ORDER_IMPORT';
+    } else if (cmd === 'bot247' || cmd.startsWith('tracking ') || cmd.startsWith('__cmd_danhsach') || cmd.startsWith('danh sach')) {
+        requiredFeature = 'BOT247_TRACKING';
+    } else if (cmd.startsWith('check ') && !cmd.startsWith('checkprofile ')) {
+        requiredFeature = 'SUPERMARKET_CHECK';
+    } else if (cmd.startsWith('checkprofile ')) {
+        requiredFeature = 'PROFILE_CHECK';
+    } else if (cmd === 'setnotify' || cmd.startsWith('setnotify ') || cmd === 'testnotify' || cmd === 'ping') {
+        requiredFeature = 'SYSTEM_ADMIN';
+    } else if (cmd === 'thoat' || cmd === '0' || cmd === 'tat' || cmd === 'exit' || cmd === 'stop' || cmd === 'quit') {
+        // Exit commands: allow if not configured and allowAllByDefault is true, or if configured and has features
+        if (!chatConfig) return permissionsConfig.allowAllByDefault;
+        return chatConfig.allowed && chatConfig.allowed.length > 0;
+    }
+
+    // If command doesn't match any known feature, DENY it!
+    if (!requiredFeature) return false;
+
+    // If this thread is NOT explicitly configured in Google Sheet, fall back to the global setting
+    if (!chatConfig) {
+        return permissionsConfig.allowAllByDefault;
+    }
+
+    // In a group chat, the group itself must explicitly allow the feature.
+    // In a private chat, the user's config must allow the feature.
+    return chatConfig.allowed && chatConfig.allowed.includes(requiredFeature);
+}
+
+
 
 const dev = process.env.NODE_ENV !== 'production';
 const nextApp = next({ dev });
@@ -124,6 +395,69 @@ async function searchGoogleSheet(searchKey) {
         return `⚠️ Lỗi tra cứu dữ liệu: ${err.message}`;
     }
 }
+
+async function searchSupermarketSheet(searchKey) {
+    try {
+        const sheetId = process.env.GOOGLE_SHEET_ID;
+        const clientEmail = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
+        const privateKey = process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n');
+
+        if (!sheetId || !clientEmail || !privateKey) {
+            return "⚠️ Hệ thống chưa cấu hình đầy đủ thông tin Google Sheet.";
+        }
+
+        const serviceAccountAuth = new JWT({
+            email: clientEmail,
+            key: privateKey,
+            scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+        });
+
+        const doc = new GoogleSpreadsheet(sheetId, serviceAccountAuth);
+        await doc.loadInfo();
+
+        let sheet = doc.sheetsByTitle['Supermarkets'] || doc.sheetsByTitle['Siêu Thị'] || doc.sheetsByIndex[1];
+        if (!sheet) {
+            return `🔍 Tra cứu siêu thị cho từ khóa: "${searchKey}"\n⚠️ Chưa tìm thấy tab "Supermarkets" hoặc "Siêu Thị" trong Google Sheets. Vui lòng tạo tab này để lưu thông tin siêu thị.`;
+        }
+
+        const rows = await sheet.getRows();
+        const normalizedKey = normalizeText(searchKey);
+
+        const matches = rows.filter(row => {
+            const rowName = normalizeText(row.get('Tên Siêu Thị') || row.get('Tên') || row.get('Name') || row.get('Mã'));
+            return rowName.includes(normalizedKey);
+        });
+
+        if (matches.length > 0) {
+            let result = `🔍 Tìm thấy ${matches.length} siêu thị cho "${searchKey}":\n\n`;
+            const limit = Math.min(matches.length, 5);
+            for (let i = 0; i < limit; i++) {
+                const m = matches[i];
+                const data = m.toObject();
+
+                const getVal = (possibleNames) => {
+                    for (const name of possibleNames) {
+                        const key = Object.keys(data).find(k => normalizeText(k) === normalizeText(name));
+                        if (key && data[key]) return data[key];
+                    }
+                    return '---';
+                };
+
+                result += `🏬 Siêu thị: ${getVal(['Tên Siêu Thị', 'Tên', 'Name'])}\n`;
+                result += `🆔 Mã: ${getVal(['Mã Siêu Thị', 'Mã', 'Code', 'ID'])}\n`;
+                result += `📍 Địa chỉ: ${getVal(['Địa Chỉ', 'Address'])}\n`;
+                result += `📞 Liên hệ: ${getVal(['Số Điện Thoại', 'SDT', 'Phone'])}\n`;
+                result += `======================================\n`;
+            }
+            return result.trim();
+        } else {
+            return `❌ Không tìm thấy siêu thị nào phù hợp với "${searchKey}".`;
+        }
+    } catch (err) {
+        return `⚠️ Lỗi tra cứu siêu thị: ${err.message}`;
+    }
+}
+
 
 // --- 247Express Helper Functions ---
 const STATUS_MAP_247 = {
@@ -264,7 +598,9 @@ async function getOrderList247(showAll = false, fromDate = '2026-01-01T00:00:00'
                 body: JSON.stringify(payload)
             });
             const data = await res.json();
-            
+
+            console.log(`🔍 [DEBUG 247] HTTP ${res.status} | ClientID: ${clientId} | Token: ${token?.substring(0,10)}... | Response:`, JSON.stringify(data).substring(0, 300));
+
             if (res.ok && !data.errorCode) {
                 let orders = data.orders || [];
                 if (!showAll) {
@@ -272,7 +608,7 @@ async function getOrderList247(showAll = false, fromDate = '2026-01-01T00:00:00'
                 }
 
                 if (orders.length === 0) return showAll ? "📭 Hiện chưa có vận đơn nào." : "✅ Tất cả đơn hàng đã giao thành công!";
-                
+
                 let reply = showAll ? `📋 TẤT CẢ VẬN ĐƠN 247\n` : `🚚 ĐƠN HÀNG ĐANG GIAO\n`;
                 reply += `━━━━━━━━━━━━━━━━━━━\n`;
                 orders.slice(0, 15).forEach((o, i) => {
@@ -313,18 +649,33 @@ async function runAutoTracking(api) {
         const now = new Date();
         const fromDate = `${now.getFullYear()}-${(now.getMonth() + 1).toString().padStart(2, '0')}-01T00:00:00`;
         const toDate = `${now.getFullYear()}-${(now.getMonth() + 1).toString().padStart(2, '0')}-31T23:59:59`;
-        
+
         const clientId = process.env.GH247_CLIENT_ID;
         const token = process.env.GH247_TOKEN;
         const url = 'https://customer-api.247express.vn/api/Order/SearchCPNOrders';
         const payload = {
-            "ClientHubID": 0, "ClientID": parseInt(clientId), "PageIndex": 0, "PageSize": 100,
-            "FromDate": fromDate, "ToDate": toDate
+            "ClientHubID": 0,
+            "ClientID": parseInt(clientId),
+            "FromDate": fromDate,
+            "ToDate": toDate,
+            "IsFilterTotalCost": true,
+            "MaxTotalCost": 0,
+            "MinTotalCost": 0,
+            "OrderType": null,
+            "PageIndex": 0,
+            "PageSize": 100,
+            "Status": null,
+            "TextSearch": ""
         };
 
         const res = await fetch(url, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'ClientID': clientId, 'token': token },
+            headers: {
+                'Content-Type': 'application/json',
+                'ClientID': String(clientId),
+                'token': token,
+                'Token': token
+            },
             body: JSON.stringify(payload)
         });
         const data = await res.json();
@@ -337,9 +688,9 @@ async function runAutoTracking(api) {
                 const orderCode = o.orderCode;
                 const currentStatus = o.statusName || '---';
                 const redisKey = `${TRACKING_PREFIX}${orderCode}`;
-                
+
                 const oldStatus = await redis.get(redisKey);
-                
+
                 if (oldStatus && oldStatus !== currentStatus) {
                     changeCount++;
                     // Status changed! Notify.
@@ -356,7 +707,7 @@ async function runAutoTracking(api) {
                     await api.sendMessage({ msg }, targetGroupId, targetType == 'Group' ? ThreadType.Group : ThreadType.User);
                     console.log(`✅ NOTIFIED: ${orderCode} (${oldStatus} -> ${currentStatus})`);
                 }
-                
+
                 // Update Redis with current status
                 await redis.set(redisKey, currentStatus, { ex: 60 * 60 * 24 * 7 });
             }
@@ -445,7 +796,7 @@ async function saveOrderToSheets(orderData) {
         const orderId = `${periodPrefix}-${nextSeq}`;
         const now = new Date();
         const timestamp = now.toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' });
-        
+
         // Format exportTime as DD/MM/YYYY HH:mm in VN timezone
         const vnOptions = { timeZone: 'Asia/Ho_Chi_Minh', day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false };
         const vnFmt = new Intl.DateTimeFormat('vi-VN', vnOptions).formatToParts(now);
@@ -654,6 +1005,32 @@ async function startBot(api) {
     botStatus = 'connected';
     io.emit('status', { status: botStatus });
 
+    // Fetch own account name to replace "BOT"
+    let botName = 'BOT';
+    try {
+        const ownId = api.getOwnId();
+        const ownInfo = await api.getUserInfo(ownId);
+        const profile = ownInfo?.changed_profiles?.[`${ownId}_0`] || ownInfo?.changed_profiles?.[ownId];
+        if (profile && (profile.displayName || profile.zaloName)) {
+            botName = profile.displayName || profile.zaloName;
+            console.log("🤖 Found bot account name:", botName);
+        }
+    } catch (e) {
+        console.error("❌ Failed to fetch bot name:", e.message);
+    }
+
+    // Monkey-patch api.sendMessage to auto-replace BOT/Bot and return instantly
+    const originalSendMessage = api.sendMessage.bind(api);
+    api.sendMessage = async function(message, threadId, threadType) {
+        if (message && typeof message.msg === 'string') {
+            message.msg = message.msg
+                .replace(/BOT247/g, `${botName}247`)
+                .replace(/BOT/g, botName.toUpperCase())
+                .replace(/Bot/g, botName);
+        }
+        return originalSendMessage(message, threadId, threadType);
+    };
+
     const cookie = api.getCookie();
     // Save to Redis if available, else local file
     if (redis) {
@@ -665,30 +1042,145 @@ async function startBot(api) {
     }
 
     api.listener.on("message", async (message) => {
-        console.log("📩 New Message:", JSON.stringify(message));
-
         const targetId = String(message.threadId);
         const senderId = String(message.data.uidFrom || message.data.senderId || message.threadId);
 
-        // Foolproof Group Detection: If threadId != senderId, it MUST be a group
-        const isGroup = targetId !== senderId;
+        // Check if the thread or sender is in the dynamic ignored list from Google Sheets
+        if (ignoredThreadIds.has(targetId) || ignoredThreadIds.has(senderId)) {
+            return; // Completely ignore messages from ignored threads or senders
+        }
+
+        console.log("📩 New Message:", JSON.stringify(message));
+
+        // Foolproof Group Detection: If threadType is Group, or threadId != senderId, it MUST be a group
+        const isGroup = message.type === ThreadType.Group || targetId !== senderId;
         const stateKey = isGroup ? `${targetId}_${senderId}` : targetId;
 
         console.log(`🎯 Detected: ${isGroup ? 'GROUP' : 'PRIVATE'} | Thread: ${targetId} | Sender: ${senderId} | StateKey: ${stateKey}`);
+
+        // --- Auto-register new groups/users to Google Sheet for easy permission management ---
+        const senderName = message.data.dName || 'Unknown';
+        if (isGroup && !autoRegisteredIds.has(targetId)) {
+            autoRegisterToSheet(targetId, 'GROUP', `Nhóm (auto-detect)`);
+        }
+        if (!autoRegisteredIds.has(senderId)) {
+            autoRegisterToSheet(senderId, isGroup ? 'USER' : 'PRIVATE', senderName);
+        }
+
         const isPlainText = typeof message.data.content === "string";
         let text = isPlainText ? message.data.content : (message.data.content?.text || message.data.content?.title || "");
 
-        // --- NEW: Menu Mode Logic ---
+        const originalText = text;
         const currentState = userState.get(stateKey);
+
+        // --- Command Prefix Filter & Foolproof State Enforcer ---
+        const hasPrefix = text.trim().startsWith('/');
+        let commandText = text.trim();
+        if (hasPrefix) {
+            commandText = commandText.substring(1).trim();
+        }
+        text = commandText;
+
+        // Check if the input is a valid response for the active state
+        let isActualStateInput = false;
+        if (currentState) {
+            const clean = commandText.toLowerCase();
+            if (currentState === 'MENU') {
+                isActualStateInput = ['1', '2', '3', '4', '5', '6', '7', '0', 'thoat', 'tat', 'exit', 'stop', 'quit'].includes(clean);
+            } else if (currentState === 'BOT247_MENU') {
+                isActualStateInput = ['1', '2', '3', '4', '0', 'thoat', 'tat', 'exit', 'stop', 'quit'].includes(clean);
+            } else if (currentState === 'WAITING_FILE') {
+                isActualStateInput = ['0', 'thoat', 'tat', 'exit', 'stop', 'quit'].includes(clean);
+            } else if (currentState === 'BOT247_SEARCH') {
+                isActualStateInput = ['0', 'thoat', 'tat', 'exit', 'stop', 'quit'].includes(clean) || /^\d{8,15}$/.test(clean);
+            } else if (currentState === 'BOT247_MONTH') {
+                isActualStateInput = ['0', 'thoat', 'tat', 'exit', 'stop', 'quit'].includes(clean) || /^\d{1,2},\d{2}$/.test(clean) || /[\d,]+/.test(clean);
+            }
+        }
+
+        // In a group chat, if there is no prefix and it is NOT a valid state response, completely ignore it as a command!
+        if (isGroup && !hasPrefix && currentState && !isActualStateInput) {
+            text = "";
+        }
+
+        // --- PERMISSION GATE (Check thread permissions from Google Sheet 'PhanQuyen') ---
+        // Skip permission check for:
+        // 1. Valid state inputs (user already passed permission when entering the state)
+        // 2. Exit keywords (always allowed for usability)
+        if (text !== "") {
+            const exitKw = ['thoat', 'tat', 'exit', 'stop', 'quit', '0'];
+            const cleanText = text.toLowerCase().trim();
+            const isExitInput = exitKw.includes(cleanText);
+            const isStateInput = currentState && isActualStateInput;
+
+            if (!isExitInput && !isStateInput) {
+                // This is a NEW top-level command → check permissions
+                if (!checkThreadPermission(targetId, text, senderId)) {
+                    console.log(`🚫 Permission DENIED for thread ${targetId} / sender ${senderId} | Command: '${text}'`);
+                    return; // Completely silent - no response to unauthorized commands
+                }
+                console.log(`✅ Permission GRANTED for thread ${targetId} / sender ${senderId} | Command: '${text}'`);
+            } else {
+                console.log(`🔓 Permission SKIPPED for thread ${targetId} | Reason: ${isExitInput ? 'exit keyword' : 'state input'} | Text: '${text}'`);
+            }
+        }
+
+        // --- State Blocking Gate (Force Exit Before Running Other Commands) ---
+        if (currentState && text !== "") {
+            const exitKeywords = ['thoat', 'tat', 'exit', 'stop', 'quit'];
+            const isTryingToExit = exitKeywords.includes(text.toLowerCase()) || text === '0';
+
+            if (!isTryingToExit) {
+                const clean = text.toLowerCase().trim();
+                let isOtherCommand = false;
+
+                if (hasPrefix) {
+                    isOtherCommand = true;
+                } else {
+                    const mainKeywords = ['menu', 'start', 'bot247', 'taodon', 'setnotify', 'testnotify', 'tinhtrang', 'ping'];
+                    const isMainKeyword = mainKeywords.includes(clean);
+                    const isStartsWithOtherCmd = clean.startsWith('check ') || clean.startsWith('checkprofile ') ||
+                        clean.startsWith('sua ') || clean.startsWith('xem ') ||
+                        clean.startsWith('chitiet ') || clean.startsWith('tracking ') ||
+                        clean.startsWith('danh sach') || clean.startsWith('danhsach');
+                    isOtherCommand = isMainKeyword || isStartsWithOtherCmd;
+                }
+
+                if (isOtherCommand) {
+                    const STATE_NAMES = {
+                        'MENU': 'Menu điều khiển chính',
+                        'WAITING_FILE': 'Tiến trình Nhập đơn hàng hàng loạt',
+                        'BOT247_MENU': 'Menu tra cứu BOT247',
+                        'BOT247_SEARCH': 'Tiến trình Tra cứu mã vận đơn BOT247',
+                        'BOT247_MONTH': 'Tiến trình Tra cứu vận đơn theo tháng BOT247'
+                    };
+                    const friendlyStateName = STATE_NAMES[currentState] || 'tiến trình khác';
+
+                    let reply = `⚠️ Bạn đang trong [${friendlyStateName}].\n`;
+                    reply += `👉 Vui lòng nhắn 'thoat' hoặc '0' để thoát khỏi tiến trình hiện tại trước khi gọi lệnh khác.`;
+
+                    await api.sendMessage({ msg: reply }, targetId, isGroup ? ThreadType.Group : ThreadType.User);
+                    return;
+                }
+            }
+        }
 
         // --- Global Exit Command (Context-Aware) ---
         const exitKeywords = ['thoat', 'tat', 'exit', 'stop', 'quit'];
-        if (exitKeywords.includes(text.toLowerCase().trim())) {
+        // Exit is triggered if:
+        // - They type an exit keyword starting with '/' (e.g. /thoat)
+        // - Or they type it directly (no prefix) in private chat (e.g. thoat)
+        // - Or they type it directly (no prefix) while in any active state (e.g. thoat)
+        const isExit = exitKeywords.includes(commandText.toLowerCase()) && (hasPrefix || !isGroup || currentState);
+
+        if (isExit) {
             let exitMsg = "👋 Đã thoát chế độ Menu.";
             if (currentState && currentState.startsWith('BOT247_')) {
                 exitMsg = "🤖 BOT247 đã dừng.";
             } else if (currentState === 'MENU') {
                 exitMsg = "🤖 Menu đã dừng.";
+            } else if (currentState === 'WAITING_FILE') {
+                exitMsg = "🤖 Đã hủy chế độ nhập đơn hàng hàng loạt.";
             }
             userState.delete(stateKey);
             await api.sendMessage({ msg: exitMsg }, targetId, isGroup ? ThreadType.Group : ThreadType.User);
@@ -696,7 +1188,11 @@ async function startBot(api) {
         }
 
         // Handle 'menu' or 'start' command, or '0' only if NO state is active
-        if (text.toLowerCase() === 'menu' || text.toLowerCase() === 'start' || (text === '0' && !currentState)) {
+        // - In group, menu/start must have prefix. In private, both prefix and non-prefix work.
+        const isMenuTrigger = (commandText.toLowerCase() === 'menu' || commandText.toLowerCase() === 'start') && (hasPrefix || !isGroup);
+        const isZeroTrigger = (text.trim() === '0' && !currentState);
+
+        if (isMenuTrigger || (isZeroTrigger && !isGroup)) {
             userState.set(stateKey, 'MENU');
             let reply = "🤖 CHÀO MỪNG BẠN ĐẾN VỚI MENU ĐIỀU KHIỂN 🤖\n\n";
             reply += "Vui lòng nhắn số tương ứng với lệnh bạn muốn:\n";
@@ -707,6 +1203,7 @@ async function startBot(api) {
             reply += "4️⃣  Chỉnh sửa/Xóa đơn hàng\n";
             reply += "5️⃣  Kiểm tra tình trạng hệ thống\n";
             reply += "6️⃣  Tra cứu thông tin siêu thị (check)\n";
+            reply += "7️⃣  Tra cứu hồ sơ nhân sự (checkprofile)\n";
             reply += "----------------------------\n";
             reply += "💡 Cú pháp: chitiet [MãĐơn] (VD: chitiet W1-M5-Y26-10)\n";
             reply += "👉 Nhắn '0' để quay lại Menu này bất cứ lúc nào.";
@@ -716,53 +1213,67 @@ async function startBot(api) {
         }
 
         if (currentState === 'MENU') {
-            if (text === '1') {
-                userState.delete(stateKey); 
+            const cleanText = text.trim();
+            if (cleanText === '1') {
+                userState.set(stateKey, 'WAITING_FILE');
                 text = 'taodon';
-            } else if (text === '2') {
+            } else if (cleanText === '2') {
                 await api.sendMessage({ msg: "🔍 Bạn muốn xem dự án nào? Nhắn theo cú pháp: xem [DựÁn] [Tuần,Tháng,Năm]\nVD: xem cholimex 1,5,26" }, targetId, isGroup ? ThreadType.Group : ThreadType.User);
                 userState.delete(stateKey);
                 return;
-            } else if (text === '3') {
+            } else if (cleanText === '3') {
                 await api.sendMessage({ msg: "📄 Nhắn: chitiet [MãĐơn]\nVD: chitiet W1-M5-Y26-10" }, targetId, isGroup ? ThreadType.Group : ThreadType.User);
                 userState.delete(stateKey);
                 return;
-            } else if (text === '4') {
+            } else if (cleanText === '4') {
                 await api.sendMessage({ msg: "🛠️ Nhắn lệnh sửa đơn của bạn.\nVD: sua [MãĐơn] them [sản phẩm]:[số lượng]" }, targetId, isGroup ? ThreadType.Group : ThreadType.User);
                 userState.delete(stateKey);
                 return;
-            } else if (text === '5') {
+            } else if (cleanText === '5') {
                 text = 'tinhtrang';
                 userState.delete(stateKey);
-            } else if (text === '6') {
+            } else if (cleanText === '6') {
                 await api.sendMessage({ msg: "🔎 Nhắn 'check [tên siêu thị]' để tôi tìm cho bạn." }, targetId, isGroup ? ThreadType.Group : ThreadType.User);
                 userState.delete(stateKey);
                 return;
-            } else if (text === '0') {
-                text = 'menu'; // Refresh main menu
-            } else if (/^\d+$/.test(text)) {
-                await api.sendMessage({ msg: "⚠️ Lựa chọn không hợp lệ. Vui lòng chọn số từ 1 đến 6, hoặc nhắn 'thoat' để dừng Bot." }, targetId, isGroup ? ThreadType.Group : ThreadType.User);
+            } else if (cleanText === '7') {
+                await api.sendMessage({ msg: "🔎 Nhắn 'checkprofile [tên/sđt]' để tôi tìm cho bạn." }, targetId, isGroup ? ThreadType.Group : ThreadType.User);
+                userState.delete(stateKey);
                 return;
+            } else if (cleanText === '0') {
+                text = 'menu'; // Refresh main menu
+            } else {
+                await api.sendMessage({ msg: "⚠️ Lựa chọn không hợp lệ. Vui lòng chọn số từ 1 đến 7, hoặc nhắn 'thoat' để dừng Bot." }, targetId, isGroup ? ThreadType.Group : ThreadType.User);
+                return;
+            }
+        }
+
+        // --- WAITING_FILE Sub-Menu Logic ---
+        if (currentState === 'WAITING_FILE') {
+            if (text.trim() === '0') {
+                userState.set(stateKey, 'MENU');
+                text = 'menu'; // Transition back to main menu
             }
         }
 
         // --- BOT247 Sub-Menu Logic ---
         if (currentState === 'BOT247_MENU') {
-            if (text === '1') {
+            const cleanText = text.trim();
+            if (cleanText === '1') {
                 text = '__cmd_danhsach';
-            } else if (text === '2') {
+            } else if (cleanText === '2') {
                 text = '__cmd_danhsach all';
-            } else if (text === '3') {
+            } else if (cleanText === '3') {
                 userState.set(stateKey, 'BOT247_SEARCH');
                 await api.sendMessage({ msg: "🔍 Mời bạn nhập Mã Vận Đơn (11 chữ số) để tra cứu.\n👉 Nhắn '0' để quay lại Menu bot247." }, targetId, isGroup ? ThreadType.Group : ThreadType.User);
                 return;
-            } else if (text === '4') {
+            } else if (cleanText === '4') {
                 userState.set(stateKey, 'BOT247_MONTH');
                 await api.sendMessage({ msg: "📅 Mời bạn nhập Tháng và Năm theo định dạng: [Tháng,Năm] (vd: 5,26)\n👉 Nhắn '0' để quay lại Menu bot247." }, targetId, isGroup ? ThreadType.Group : ThreadType.User);
                 return;
-            } else if (text === '0') {
+            } else if (cleanText === '0') {
                 text = 'bot247'; // Refresh BOT247 menu
-            } else if (/^\d+$/.test(text)) {
+            } else {
                 await api.sendMessage({ msg: "⚠️ Lựa chọn không hợp lệ. Vui lòng chọn số từ 1 đến 4, hoặc nhắn 'thoat' để dừng BOT247." }, targetId, isGroup ? ThreadType.Group : ThreadType.User);
                 return;
             }
@@ -770,25 +1281,38 @@ async function startBot(api) {
 
         // --- BOT247 Month Search Logic ---
         if (currentState === 'BOT247_MONTH') {
-            if (text === '0') {
+            const cleanText = text.trim();
+            if (cleanText === '0') {
                 userState.set(stateKey, 'BOT247_MENU');
                 text = 'bot247'; // Refresh menu
-            } else if (/^\d{1,2},\d{2}$/.test(text)) {
-                text = `__cmd_danhsach ${text}`;
+            } else if (/^\d{1,2},\d{2}$/.test(cleanText)) {
+                text = `__cmd_danhsach ${cleanText}`;
                 userState.set(stateKey, 'BOT247_MENU'); // Reset state after search
-            } else {
+            } else if (/[\d,]+/.test(cleanText)) {
                 await api.sendMessage({ msg: "⚠️ Định dạng không đúng. Vui lòng nhập [Tháng,Năm] (vd: 5,26) hoặc nhắn '0' để quay lại." }, targetId, isGroup ? ThreadType.Group : ThreadType.User);
+                return;
+            } else {
+                // Silently ignore normal chat messages
                 return;
             }
         }
-        
+
         // --- BOT247 Search Logic ---
         if (currentState === 'BOT247_SEARCH') {
-            if (text === '0') {
+            const cleanText = text.trim();
+            if (cleanText === '0') {
                 text = 'bot247';
                 userState.set(stateKey, 'BOT247_MENU');
+            } else if (/^\d{8,15}$/.test(cleanText)) {
+                // Let it pass through
+            } else {
+                // Silently ignore normal chat messages
+                return;
             }
         }
+
+        // --- Command Prefix Filter (Handled at the top of the message listener) ---
+
         // --- END: BOT247 Sub-Menu Logic ---
         // --- END: Menu Mode Logic ---
 
@@ -971,19 +1495,26 @@ async function startBot(api) {
         }
 
         if (excelFile && excelFile.url) {
-            console.log("📎 Detected Excel File, caching for thread:", targetId);
-            lastFileCache.set(targetId, {
-                url: excelFile.url,
-                name: excelFile.name,
-                timestamp: Date.now()
-            });
-            // If there's no command in this message, just acknowledge
-            if (!text.toLowerCase().includes('nhap ')) {
-                let reply = `✅ Đã nhận file: ${excelFile.name}\n\n`;
-                reply += `Bây giờ, bạn hãy nhắn tin theo cú pháp sau để tôi bắt đầu nhập dữ liệu:\n`;
-                reply += `👉 nhap [DựÁn] [Tuần,Tháng,Năm]\n\n`;
-                reply += `Ví dụ: nhap cholimex 1,5,26`;
-                await api.sendMessage({ msg: reply }, targetId, isGroup ? ThreadType.Group : ThreadType.User);
+            const hasNhapCommand = text.toLowerCase().includes('nhap ') || originalText.toLowerCase().includes('nhap ');
+
+            if (currentState === 'WAITING_FILE' || hasNhapCommand) {
+                console.log("📎 Detected Excel File, caching for thread:", targetId);
+                lastFileCache.set(targetId, {
+                    url: excelFile.url,
+                    name: excelFile.name,
+                    timestamp: Date.now()
+                });
+                // If there's no command in this message, just acknowledge
+                if (!hasNhapCommand) {
+                    let reply = `✅ Đã nhận file: ${excelFile.name}\n\n`;
+                    reply += `Bây giờ, bạn hãy nhắn tin theo cú pháp sau để tôi bắt đầu nhập dữ liệu:\n`;
+                    reply += `👉 nhap [DựÁn] [Tuần,Tháng,Năm]\n\n`;
+                    reply += `Ví dụ: nhap cholimex 1,5,26\n\n`;
+                    reply += `👉 Nhắn '0' để hủy và quay lại Menu.`;
+                    await api.sendMessage({ msg: reply }, targetId, isGroup ? ThreadType.Group : ThreadType.User);
+                }
+            } else {
+                console.log("📎 File detected but ignored (not in WAITING_FILE state and no command)");
             }
         }
 
@@ -1017,6 +1548,7 @@ async function startBot(api) {
                         const result = await processExcelFile(tempPath, globalInfo);
                         fs.unlinkSync(tempPath);
                         lastFileCache.delete(targetId); // Clear after use
+                        userState.delete(stateKey); // Clear user state on successful import
 
                         let reply = `📊 KẾT QUẢ NHẬP HÀNG LOẠT:\n`;
                         reply += `✅ Thành công: ${result.successCount} đơn\n`;
@@ -1065,18 +1597,6 @@ async function startBot(api) {
             if (text.toLowerCase() === 'bot247') {
                 userState.set(stateKey, 'BOT247_MENU');
 
-                // --- Send Logo Image correctly ---
-                try {
-                    const logoPath = path.join(__dirname, 'public', 'logo_247.png');
-                    if (fs.existsSync(logoPath)) {
-                        const threadType = isGroup ? ThreadType.Group : ThreadType.User;
-                        const attachments = await api.uploadAttachment(logoPath, targetId, threadType);
-                        await api.sendMessage({ msg: "", attachments: attachments }, targetId, threadType);
-                    }
-                } catch (err) {
-                    console.error("❌ Send Logo Error:", err.message);
-                }
-
                 let m = `🚚 BOT 247EXPRESS - MENU THEO DÕI\n`;
                 m += `━━━━━━━━━━━━━━━━━━━\n`;
                 m += `1️⃣  Xem vận đơn mới nhất (đang giao)\n`;
@@ -1093,7 +1613,7 @@ async function startBot(api) {
                 try {
                     const parts = text.split(' ');
                     const showAll = text.toLowerCase().includes('all');
-                    
+
                     // Pattern MM/YYYY or MM,YY
                     const monthPart = parts.find(p => /^\d{1,2}\/\d{4}$/.test(p) || /^\d{1,2},\d{2}$/.test(p));
                     let fromDate = '2026-01-01T00:00:00';
@@ -1174,9 +1694,13 @@ async function startBot(api) {
                 } catch (err) {
                     reply = `⚠️ Lỗi: ${err.message}`;
                 }
+            } else if (text.toLowerCase().startsWith("checkprofile ")) {
+                const param = text.substring(13).trim();
+                const res = await searchGoogleSheet(param);
+                reply = res + "\n\n👉 Nhắn '0' để quay lại Menu.";
             } else if (text.toLowerCase().startsWith("check ")) {
                 const param = text.substring(6).trim();
-                const res = await searchGoogleSheet(param);
+                const res = await searchSupermarketSheet(param);
                 reply = res + "\n\n👉 Nhắn '0' để quay lại Menu.";
             } else if (text.toLowerCase().startsWith("taodon ")) {
                 const orderData = parseOrderCommand(text);
@@ -1220,13 +1744,16 @@ async function startBot(api) {
                 reply = res + "\n\n👉 Nhắn '0' để quay lại Menu.";
             } else if (text.toLowerCase() === "tinhtrang") {
                 try {
+                    // Pull latest permissions
+                    await loadPermissionsFromSheets();
+
                     const doc = new GoogleSpreadsheet(process.env.GOOGLE_SHEET_ID, new JWT({
                         email: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
                         key: process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
                         scopes: ['https://www.googleapis.com/auth/spreadsheets'],
                     }));
                     await doc.loadInfo();
-                    reply = `🤖 TRẠNG THÁI HỆ THỐNG:\n✅ Bot: Đang hoạt động\n✅ Google Sheets: Đã kết nối (${doc.title})\n\n👉 Nhắn '0' để quay lại Menu.`;
+                    reply = `🤖 TRẠNG THÁI HỆ THỐNG:\n✅ Bot: Đang hoạt động\n✅ Google Sheets: Đã kết nối (${doc.title})\n🔄 Phân quyền: Đã đồng bộ từ Sheets\n\n👉 Nhắn '0' để quay lại Menu.`;
                 } catch (err) {
                     reply = `🤖 TRẠNG THÁI HỆ THỐNG:\n✅ Bot: Đang hoạt động\n❌ Google Sheets: Lỗi kết nối (${err.message})\n\n👉 Nhắn '0' để quay lại Menu.`;
                 }
@@ -1248,11 +1775,21 @@ async function startBot(api) {
             }
         }
 
-        io.emit('new_message', {
+        const newLog = {
             sender: senderId,
-            text: text,
-            isGroup: isGroup
-        });
+            senderName: message.data.dName || "Người dùng Zalo",
+            text: originalText || "[Không có nội dung chữ]",
+            isGroup: isGroup,
+            timestamp: Date.now()
+        };
+
+        // Add to RAM buffer
+        recentLogs.unshift(newLog);
+        if (recentLogs.length > MAX_LOGS) {
+            recentLogs.pop();
+        }
+
+        io.emit('new_message', newLog);
     });
 
     api.listener.start();
@@ -1271,16 +1808,22 @@ async function login() {
     botStatus = 'logging_in';
     io.emit('status', { status: botStatus });
 
-    // Zalo init with sharp for image metadata
+    const metadataGetter = async (filePath) => {
+        const metadata = await sharp(filePath).metadata();
+        const size = metadata.size || fs.statSync(filePath).size;
+        return {
+            width: metadata.width,
+            height: metadata.height,
+            size: size
+        };
+    };
+
     const zalo = new Zalo({}, {
-        imageMetadataGetter: async (filePath) => {
-            const metadata = await sharp(filePath).metadata();
-            return {
-                width: metadata.width,
-                height: metadata.height,
-            };
-        },
+        imageMetadataGetter: metadataGetter
     });
+    // Add to options directly on instance as well to prevent library bugs
+    zalo.options = zalo.options || {};
+    zalo.options.imageMetadataGetter = metadataGetter;
 
     // Try to restore session from Redis first, then local file
     let cookie = null;
@@ -1336,9 +1879,26 @@ nextApp.prepare().then(() => {
         cors: { origin: "*", methods: ["GET", "POST"] }
     });
 
-    io.on('connection', (socket) => {
+    io.on('connection', async (socket) => {
         socket.emit('status', { status: botStatus });
         if (qrData) socket.emit('qr', { qr: qrData });
+
+        // Sync from sheets on fresh UI loads so dashboard is always in sync with sheets
+        await loadPermissionsFromSheets();
+
+        socket.emit('recent_logs', recentLogs);
+        socket.emit('permissions_update', permissionsConfig);
+
+        socket.on('save_permissions', async (newConfig) => {
+            permissionsConfig = newConfig;
+            fs.writeFileSync(PERMISSIONS_FILE, JSON.stringify(permissionsConfig, null, 2));
+            io.emit('permissions_update', permissionsConfig); // Sync to all open clients
+            console.log("⚙️ Đã đồng bộ và lưu cấu hình phân quyền mới!");
+
+            // Sync to Google Sheet
+            await savePermissionsToSheets(newConfig);
+        });
+
         socket.on('login', () => botStatus === 'disconnected' && login());
         socket.on('logout', async () => {
             if (redis) await redis.del('zalo_session');
@@ -1350,9 +1910,19 @@ nextApp.prepare().then(() => {
     // Handle all Next.js requests
     app.use((req, res) => handle(req, res));
 
-    server.listen(PORT, (err) => {
+    server.listen(PORT, async (err) => {
         if (err) throw err;
         console.log(`> Ready on http://localhost:${PORT}`);
+
+        // Load permissions from sheets at startup
+        await loadPermissionsFromSheets();
+
+        // Start background poll every 10 minutes to auto-sync manually updated sheets
+        setInterval(() => {
+            console.log("⏰ Auto-syncing permissions from Google Sheets...");
+            loadPermissionsFromSheets();
+        }, 10 * 60 * 1000);
+
         login(); // Auto login on startup
     });
 });
